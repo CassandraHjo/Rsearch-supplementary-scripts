@@ -1,0 +1,367 @@
+---
+title: "Mock community data analyses with Rsearch"
+output: 
+  html_document:
+    code_folding: show
+    number_sections: false
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 4
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+## Load libraries
+
+```{r Load libraries, echo=FALSE, message=FALSE}
+library(tidyverse)
+library(microseq)
+library(Rsearch)
+```
+
+## Prepare directories
+
+```{r Prepare directories, eval=FALSE}
+fastq.folder <- "mock_fastq" # fastq directory with the samples that will be used
+tmp.folder <- "rsearch_results/tmp_rsearch"
+rsearch_dir <- "rsearch_results"
+metadata.file <- "METADATAFILE" # Replace with your metadata file name with sample names and other information
+
+if (!dir.exists(rsearch_dir)) {
+  dir.create(rsearch_dir)
+}
+if (!dir.exists(tmp.folder)) {
+  dir.create(tmp.folder)
+}
+```
+
+## Examine fastq files
+
+```{r Read metadata}
+# Read metadata
+metadata.tbl <- read_tsv(metadata.file) %>% 
+  mutate(n_reads = 0) %>% 
+  mutate(n_rsearch_filtered = 0) %>% 
+  mutate(n_rsearch_merged = 0) %>% 
+  mutate(n_dereplicated = 0) %>% 
+  mutate(n_wo_chimera = 0)
+
+for(i in 1:length(metadata.tbl$R1_file)){
+  fq1 <- readFastq(file.path(fastq.folder, metadata.tbl$R1_file[i]))
+  metadata.tbl$n_reads[i] <- nrow(fq1)
+}
+```
+
+```{r}
+for(i in 1:nrow(metadata.tbl)){
+  R1.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R1_file[i]))
+  R2.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R2_file[i]))
+  
+  gg.obj <- plot_base_quality(R1.tbl, 
+                              R2.tbl, 
+                              show_overlap_box = TRUE,
+                              plot_title = paste("Sample:", metadata.tbl$sample_id[i]))
+  print(gg.obj)
+  break # Remove this line to loop through all samples
+}
+```
+
+# Optimize trimming 
+
+## Merging raw reads to establish baseline
+```{r}
+raw.tbl <- tibble(sample_id = metadata.tbl$sample_id,
+                  n_merged = 0)
+
+for(i in 1:nrow(metadata.tbl)){
+  R1.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R1_file[i]))
+  R2.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R2_file[i]))
+  
+  merging_raw.tbl <- vs_merging_lengths(fastq_input = R1.tbl, 
+                                        reverse = R2.tbl)
+  
+  print(attr(merging_raw.tbl, "plot"))
+  print(data.frame(attr(merging_raw.tbl, "statistics")))
+  
+  raw.tbl$n_merged[i] <- attr(merging_raw.tbl, "statistics")$Merged
+}
+
+save(raw.tbl, file = file.path(rsearch_dir, "raw.tbl.RData"))
+```
+
+## Optimize truncee_rate
+
+```{r}
+# Choosing the first sample in each run for optimization
+first_per_run <- metadata.tbl %>%
+  group_by(run_id) %>%
+  slice_head(n = 1) %>%
+  ungroup()  
+
+opt.tbl <- tibble(sample_id = first_per_run$sample_id,
+                  truncee_rate = 0,
+                  n_merged = 0)
+
+for(i in 1:nrow(first_per_run)){
+  R1.tbl <- readFastq(file.path(fastq.folder, first_per_run$R1_file[i]))
+  R2.tbl <- readFastq(file.path(fastq.folder, first_per_run$R2_file[i]))
+  
+  optimize_truncee_rate.tbl <- vs_optimize_truncee_rate(fastq_input = R1.tbl, 
+                                                        reverse = R2.tbl
+  )
+  
+  print(attr(optimize_truncee_rate.tbl, "plot"))
+  
+  # Collect results
+  idx <- which.max(optimize_truncee_rate.tbl$merged_read_pairs)
+  opt.tbl$truncee_rate[i] <- optimize_truncee_rate.tbl$truncee_rate_value[idx]
+  opt.tbl$n_merged[i] <- optimize_truncee_rate.tbl$merged_read_pairs[idx]
+}
+
+save(opt.tbl, file = file.path(rsearch_dir, "opt.tbl.RData"))
+```
+
+# Trimming, merging, dereplication, chimera detection
+
+```{r}
+for(i in 1:nrow(metadata.tbl)){
+  cat("******************************************************", "\n")
+  cat("Processing sample:", metadata.tbl$sample_id[i], "\n")
+  
+  R1.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R1_file[i]))
+  R2.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R2_file[i]))
+  
+  # Trim and filter
+  cat("Trimming...", "\n")
+  R1_filt.tbl <- vs_fastx_trim_filt(R1.tbl, 
+                                    R2.tbl,
+                                    minlen = 20, # This is default value in DADA2
+                                    truncee_rate = 0.01, 
+                                    maxee_rate = 0.01 # This is the value used in the optimization function
+  )
+  R2_filt.tbl <- attr(R1_filt.tbl, "reverse")
+  
+  # Collect data from trimming
+  metadata.tbl$n_rsearch_filtered[i] <- nrow(R1_filt.tbl)
+  
+  # Merge reads
+  cat("Merging...", "\n")
+  merged.tbl <- vs_fastq_mergepairs(R1_filt.tbl, R2_filt.tbl)
+  
+  # Collect data from merging
+  metadata.tbl$n_rsearch_merged[i] <- nrow(merged.tbl)
+  
+  # Dereplicate
+  cat("Dereplication...", "\n")
+  derep.tbl <- vs_fastx_uniques(fastx_input = merged.tbl,
+                                sample = metadata.tbl$sample_id[i])
+  
+  # Collect data from dereplication
+  n_derep_reads_total <- derep.tbl %>% 
+    mutate(size = str_extract(Header, "(?<=;size=)\\d+")) |>
+    mutate(size = as.numeric(size)) %>%
+    select(size) %>%
+    sum()
+  
+  metadata.tbl$n_dereplicated[i] <- n_derep_reads_total
+  
+  # Detect chimeras
+  cat("Chimera detection...", "\n")
+  derep_wo_chimera.tbl <- vs_uchime_denovo(derep.tbl)
+  
+  # Collect data from chimera detection
+  n_wo_chimera_reads_total <- derep_wo_chimera.tbl %>% 
+    mutate(size = str_extract(Header, "(?<=;size=)\\d+")) |>
+    mutate(size = as.numeric(size)) %>%
+    select(size) %>%
+    sum()
+  
+  metadata.tbl$n_wo_chimera[i] <- n_wo_chimera_reads_total
+  
+  # Write results to files
+  writeFasta(derep_wo_chimera.tbl, 
+             out.file = file.path(tmp.folder, "fasta", paste0(metadata.tbl$sample_id[i], "_dereplicated.fasta")))
+}
+
+save(metadata.tbl, file = file.path(rsearch_dir, "metadata.tbl.RData"))
+```
+
+# Clustering preparations
+
+## Prepare fasta files
+
+```{r}
+files <- list.files(file.path(tmp.folder, "fasta"), 
+                    pattern = "_dereplicated\\.fasta$", 
+                    full.names = TRUE)
+all.tbl <- lapply(files, readFasta) %>% 
+  bind_rows()
+
+save(all.tbl, file = file.path(rsearch_dir, "all.tbl.RData"))
+```
+
+## Dereplicate all reads together
+
+```{r}
+all_derep.tbl <- vs_fastx_uniques(fastx_input = all.tbl,
+                                  minuniquesize = 2 # Set minimum unique size to 2 to avoid singleton centroids
+) 
+
+save(all_derep.tbl, file = file.path(rsearch_dir, "all_derep.tbl.RData"))
+```
+
+# Clustering
+
+## Cluster size
+
+```{r}
+id <- 0.98 # Set identity threshold for clustering
+
+sequence.tbl <- vs_cluster_size(all_derep.tbl,
+                                id = id,
+                                relabel = "OTU",
+                                size_column = TRUE,
+                                threads = 4)
+
+cat("Number of clusters at", id, "identity:", nrow(sequence.tbl), "\n")
+
+save(sequence.tbl, file = file.path(rsearch_dir, paste0("sequence.tbl_", id, ".RData")))
+```
+
+### Creating read count table
+
+```{r}
+readcount.tbl <- vs_usearch_global(fastx_input = all.tbl,
+                                   database = sequence.tbl,
+                                   otutabout = TRUE,
+                                   id = id,
+                                   threads = 4)
+
+save(readcount.tbl, file = file.path(rsearch_dir, paste0("readcount.tbl_", id, ".RData")))
+```
+
+# Cluster UNOISE
+
+```{r}
+minsize <- 8 # Set minimum size for UNOISE clustering
+
+unoise.tbl <- vs_cluster_unoise(all.tbl, 
+                                  minsize = minsize,
+                                  unoise_alpha = 2, # Default value
+                                  threads = 4)
+
+readcount_unoise.tbl <- unoise.tbl %>% 
+  select(-Sequence) %>% 
+  separate_wider_delim(Header, delim = ";", names = c("Header", "size")) %>%
+  rename(otu_id = Header) %>% 
+  select(-size)
+
+sequence_unoise.tbl <- unoise.tbl %>% 
+  select(Header, Sequence) %>% 
+  separate_wider_delim(Header, delim = ";", names = c("Header", "size")) %>% 
+  select(-size)
+
+save(readcount_unoise.tbl, file = file.path(rsearch_dir, paste0("readcount.tbl_unoise.RData")))
+
+save(sequence_unoise.tbl, file = file.path(rsearch_dir, paste0("sequence.tbl_unoise.RData")))
+```
+
+# OTU sample prevalence
+
+```{r}
+# Use one of the readcount tables created above to create a prevalence table
+
+prevalence_tbl <- readcount.tbl %>%
+  pivot_longer(
+    cols      = -otu_id,
+    names_to  = "sample",
+    values_to = "count"
+  ) %>%
+  group_by(otu_id) %>%
+  summarise(
+    prevalence = sum(count > 0, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+cat("Total number of OTUs:", nrow(prevalence_tbl), "\n",
+    "Number of OTUs with prevalence of 1:", 
+    sum(prevalence_tbl$prevalence == 1), "\n",
+    "Number of OTUs with prevalence of 15:", 
+    sum(prevalence_tbl$prevalence == 15), "\n")
+```
+
+# Over-merging and over-splitting
+
+```{r}
+# Use one of the sequence tables created above to compare with the gold standard
+
+sequence.tbl <- sequence.tbl %>% 
+  select(c(Header, Sequence)) %>% 
+  mutate(Header = str_remove(Header, ";.*"))
+
+gold_standard.file <- "gold_standard.fasta"
+
+align.tbl <- vs_usearch_global(fastx_input = sequence.tbl,
+                               database = gold_standard.file,
+                               id = 0.99,
+                               threads = 4) %>% 
+  select(query, target, id)
+
+load("fasit.tbl_100.RData")
+
+fasit_target <- fasit_all.tbl$target
+align_target <- align.tbl$target
+
+# Over-merged
+length(setdiff(fasit_target, align_target))
+
+# Over split
+t <- as.data.frame(table(align_target))
+sum(t$Freq > 1)
+```
+
+# Comparing results with the ground truth
+
+```{r}
+load("fasit.tbl_100.RData")
+
+fasit_all.tbl <- fasit_all.tbl %>%
+  mutate(groundtruth_n_reads = n) %>%
+  mutate(groundtruth_rel_abundance = abundance) %>% 
+  select(target, groundtruth_n_reads, groundtruth_rel_abundance)
+
+fastx_input <- sequence.tbl %>%
+  select(c(Header, Sequence))
+
+fasit.aln <- vs_usearch_global(fastx_input = fastx_input,
+                               database = gold_standard.file,
+                               id = 0.99, # Set identity threshold for alignment
+                               threads = 4) %>% 
+  mutate(otu_id = str_remove(query, ";.*")) %>% 
+  select(otu_id, target, id) %>% 
+  group_by(target) %>%
+  slice_max(order_by = id, n = 1, with_ties = FALSE)
+
+readcount_modified.tbl <- readcount.tbl %>% 
+  rowwise() %>% 
+  mutate(total_reads_rsearch = sum(c_across(-otu_id))) %>%
+  ungroup() %>% 
+  select(otu_id, total_reads_rsearch)
+
+total_read_sum <- sum(readcount_modified.tbl$total_reads_rsearch)
+
+rsearch_res.tbl <- fasit.aln %>%
+  full_join(readcount_modified.tbl, by = "otu_id") %>% 
+  mutate(rsearch_rel_abundance = total_reads_rsearch / total_read_sum) %>%
+  full_join(fasit_all.tbl, by = "target") %>% 
+  mutate(
+    rsearch_rel_abundance = replace_na(rsearch_rel_abundance, 0),
+    groundtruth_rel_abundance = replace_na(groundtruth_rel_abundance, 0)
+  )
+
+cat("Correlation with ground truth =", round(cor(rsearch_res.tbl$rsearch_rel_abundance, rsearch_res.tbl$groundtruth_rel_abundance), 4))
+```

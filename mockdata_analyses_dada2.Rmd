@@ -1,0 +1,290 @@
+---
+title: "Mock community data analyses with dada2"
+output: 
+  html_document:
+    code_folding: show
+    number_sections: false
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 4
+    df_print: paged
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+## Load libraries
+
+```{r Load libraries, echo=FALSE, message=FALSE}
+library(tidyverse)
+library(dada2)
+library(microseq)
+```
+
+## Prepare directories
+
+```{r Prepare directories, eval=FALSE}
+fastq.folder <- "mock_fastq" # fastq directory with the samples that will be used
+tmp.folder <- "dada2_results/tmp_dada2"
+# qual_dir <- "qual_pdf" # quality scores plots
+dada2_dir <- "dada2_results" # dada2 results
+metadata.file <- "mock_metadata.txt" # metadata file with sample names and other information
+
+if (!dir.exists(dada2_dir)) {
+  # dir.create(qual_dir)
+  dir.create(dada2_dir)}
+
+if (!dir.exists(tmp.folder)) {
+  dir.create(tmp.folder)
+}
+```
+
+## Examine fastq files
+
+```{r Read metadata}
+# Read metadata
+metadata.tbl <- read_tsv(metadata.file) %>% 
+  mutate(n_reads = 0) %>% 
+  mutate(n_dada2_filtered = 0) %>% 
+  mutate(n_dada2_merged = 0) %>% 
+  mutate(overlap_length = 0)
+
+for(i in 1:length(metadata.tbl$R1_file)){
+  fq1 <- readFastq(file.path(fastq.folder, metadata.tbl$R1_file[i]))
+  metadata.tbl$n_reads[i] <- nrow(fq1)
+}
+
+# Extract sample names
+sample_names <- metadata.tbl$sample_id
+```
+
+# Trimming 
+
+```{r Prepare outputnames for filtered reads}
+filt_R1_files <- file.path(tmp.folder, paste0(metadata.tbl$sample_id, "_R1_filt.fastq"))
+filt_R2_files <- file.path(tmp.folder, paste0(metadata.tbl$sample_id, "_R2_filt.fastq"))
+```
+
+```{r Filter and trim}
+# Defining arguments
+truncLen <- c(250, 220)
+
+# Running filtering
+filt.tbl <- filterAndTrim(fwd = file.path(fastq.folder, metadata.tbl$R1_file), 
+                          filt = filt_R1_files, 
+                          rev = file.path(fastq.folder, metadata.tbl$R2_file), 
+                          filt.rev = filt_R2_files,
+                          truncLen = truncLen, 
+                          compress = FALSE,
+                          verbose = TRUE,
+                          multithread = TRUE # Use all available cores
+)
+
+save(filt.tbl, file = file.path(tmp.folder, "filt.tbl.RData"))
+
+for(i in 1:length(filt_R1_files)){
+  fq1 <- readFastq(filt_R1_files[i])
+  metadata.tbl$n_dada2_filtered[i] <- nrow(fq1)
+}
+
+save(metadata.tbl, file = file.path(tmp.folder, "metadata.tbl.RData"))
+```
+
+# Learn errors
+
+```{r}
+err.obj_R1 <- learnErrors(fls = filt_R1_files, 
+                          multithread = TRUE,
+                          verbose= TRUE)
+save(err.obj_R1, file = file.path(tmp.folder, "err.obj_R1.RData"))
+
+err.obj_R2 <- learnErrors(fls = filt_R2_files, 
+                          multithread = TRUE,
+                          verbose = TRUE)
+save(err.obj_R2, file = file.path(tmp.folder, "err.obj_R2.RData"))
+```
+
+# DADA2 main inference
+
+```{r Infere ASVs}
+dada.obj_R1 <- dada(filt_R1_files, 
+                    err = err.obj_R1, 
+                    multithread = TRUE, 
+                    verbose = TRUE)
+save(dada.obj_R1, file = file.path(tmp.folder, "dada.obj_R1.RData"))
+
+dada.obj_R2 <- dada(filt_R2_files, 
+                    err = err.obj_R2, 
+                    multithread = TRUE, 
+                    verbose = TRUE)
+save(dada.obj_R2, file = file.path(tmp.folder, "dada.obj_R2.RData"))
+```
+
+# Merge sequences
+
+```{r}
+merged.obj <- mergePairs(dadaF = dada.obj_R1,
+                         derepF = filt_R1_files,
+                         dadaR = dada.obj_R2,
+                         derepR = filt_R2_files,
+                         verbose = TRUE)
+
+save(merged.obj, file = file.path(tmp.folder, "merged.obj.RData"))
+
+for(i in 1:length(filt_R1_files)){
+  fq1 <- readFastq(filt_R1_files[i])
+  metadata.tbl$n_dada2_merged[i] <- sum(merged.obj[[basename(filt_R1_files)[i]]]$abundance)
+  metadata.tbl$overlap_length[i] <- min(merged.obj[[basename(filt_R1_files)[i]]]$nmatch)
+}
+
+save(metadata.tbl, file = file.path(tmp.folder, "metadata.tbl.RData"))
+```
+
+# Make read count matrix
+
+```{r}
+readcount.mat <- makeSequenceTable(merged.obj)
+dim(readcount.mat)
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(readcount.mat)))
+plot(table(nchar(getSequences(readcount.mat))),
+     xlab = "Sequence length",
+     ylab = "Number of sequences",
+     main = "Distribution of sequence lengths")
+```
+
+# Remove chimeras
+
+```{r}
+readcount.mat <- removeBimeraDenovo(readcount.mat, 
+                                    method = "consensus", 
+                                    multithread = TRUE,
+                                    verbose = TRUE)
+dim(readcount.mat)
+```
+
+# Create centroids fasta file and read count table
+
+```{r}
+centroids.tbl <- tibble(Header = str_c("OTU", 1:ncol(readcount.mat)),
+                        Sequence = colnames(readcount.mat))
+
+writeFasta(centroids.tbl, out.file = file.path(dada2_dir, "centroids_dada2.fasta"))
+
+# Modifications
+colnames(readcount.mat) <- centroids.tbl$Header
+readcount.mat <- t(readcount.mat) # Transpose the matrix to have samples as rows and ASVs as columns)
+readcount.tbl <- as_tibble(readcount.mat, rownames = "OTU")
+
+write_delim(readcount.tbl, delim = "\t", file = file.path(dada2_dir, "readcounts_dada2.tsv"))
+```
+
+## Update metadata table
+
+```{r}
+metadata.tbl <- left_join(metadata.tbl,
+                          tibble(n_dada2_reads = colSums(readcount.mat),
+                                 sample_id = str_remove(colnames(readcount.mat), "_R1_filt\\.fastq$")),
+                          by = "sample_id")
+
+save(metadata.tbl, file = file.path(dada2_dir, "metadata.tbl.RData"))
+```
+
+# OTU sample prevalence
+
+```{r}
+# Use the readcount table created above to create a prevalence table
+
+prevalence_tbl <- readcount.tbl %>%
+  pivot_longer(
+    cols      = -OTU,
+    names_to  = "sample",
+    values_to = "count"
+  ) %>%
+  group_by(OTU) %>%
+  summarise(
+    prevalence = sum(count > 0, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+cat("Total number of OTUs:", nrow(prevalence_tbl), "\n",
+    "Number of OTUs with prevalence of 1:", 
+    sum(prevalence_tbl$prevalence == 1), "\n",
+    "Number of OTUs with prevalence of 15:", 
+    sum(prevalence_tbl$prevalence == 15), "\n")
+```
+
+# Over-merging and over-splitting
+
+```{r}
+# Use the sequence table created above to compare with the gold standard
+
+sequence.tbl <- sequence.tbl %>% 
+  select(c(Header, Sequence)) %>% 
+  mutate(Header = str_remove(Header, ";.*"))
+
+gold_standard.file <- "gold_standard.fasta"
+
+align.tbl <- vs_usearch_global(fastx_input = sequence.tbl,
+                               database = gold_standard.file,
+                               id = 0.99,
+                               threads = 4) %>% 
+  select(query, target, id)
+
+load("fasit.tbl_100.RData")
+
+fasit_target <- fasit_all.tbl$target
+align_target <- align.tbl$target
+
+# Over-merged
+length(setdiff(fasit_target, align_target))
+
+# Over split
+t <- as.data.frame(table(align_target))
+sum(t$Freq > 1)
+```
+
+# Comparing results with the ground truth
+
+```{r}
+load("fasit.tbl_100.RData")
+
+fasit_all.tbl <- fasit_all.tbl %>%
+  mutate(groundtruth_n_reads = n) %>%
+  mutate(groundtruth_rel_abundance = abundance) %>% 
+  select(target, groundtruth_n_reads, groundtruth_rel_abundance)
+```
+
+```{r}
+fasit.aln <- vs_usearch_global(fastx_input = sequence.tbl,
+                               database = gold_standard.file,
+                               id = 0.99,
+                               threads = 4) %>% 
+  mutate(OTU = query) %>% 
+  select(OTU, target, id) %>% 
+  group_by(target) %>%
+  slice_max(order_by = id, n = 1, with_ties = FALSE)
+
+
+readcount_modified.tbl <- readcount.tbl %>%
+  rowwise() %>% 
+  mutate(total_reads_dada2 = sum(c_across(-OTU))) %>%
+  ungroup() %>% 
+  select(OTU, total_reads_dada2)
+
+total_read_sum <- sum(readcount_modified.tbl$total_reads_dada2)
+
+dada2_res.tbl <- fasit.aln %>%
+  full_join(readcount_modified.tbl, by = "OTU") %>% 
+  mutate(dada2_rel_abundance = total_reads_dada2 / total_read_sum) %>%
+  full_join(fasit_all.tbl, by = "target") %>% 
+  mutate(
+    groundtruth_rel_abundance = replace_na(groundtruth_rel_abundance, 0)
+  )
+
+round(cor(dada2_res.tbl$dada2_rel_abundance, dada2_res.tbl$groundtruth_rel_abundance), 4)
+```
+
