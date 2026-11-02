@@ -1,4 +1,6 @@
-R1 <- readFastq(str_c("fastq/", sample.tbl$R1_file[1]))
-R2 <- readFastq(str_c("fastq/", sample.tbl$R2_file[1]))
+library(Rsearch)
+fastq_path <- "mock_fastq"
 
-plot_base_quality(R1, R2, show_overlap_box = F)
+plot_base_quality(file.path(fastq_path, "P15_ZB_R1.fastq.gz"),
+                  file.path(fastq_path, "P15_ZB_R2.fastq.gz"),
+                  show_overlap_box = FALSE)
