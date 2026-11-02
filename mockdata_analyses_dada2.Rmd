@@ -220,7 +220,7 @@ cat("Total number of OTUs:", nrow(prevalence_tbl), "\n",
 # Over-merging and over-splitting
 
 ```{r}
-# Use the sequence table created above to compare with the gold standard
+# Use the sequence table and the read count table created above to compare with the gold standard
 
 sequence.tbl <- sequence.tbl %>% 
   select(c(Header, Sequence)) %>% 
@@ -245,6 +245,15 @@ length(setdiff(fasit_target, align_target))
 # Over split
 t <- as.data.frame(table(align_target))
 sum(t$Freq > 1)
+
+# Reads of unassigned OTUs
+unassigned_otus <- align.tbl$query
+
+readcount_filt.tbl <- readcount.tbl |> 
+  filter(!OTU %in% unassigned_otus) |> 
+  mutate(sum = rowSums(across(-OTU), na.rm = TRUE))
+
+sum(readcount_filt.tbl$sum)
 ```
 
 # Comparing results with the ground truth
