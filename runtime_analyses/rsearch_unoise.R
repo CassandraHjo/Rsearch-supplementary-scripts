@@ -1,21 +1,54 @@
-for(i in 1:nrow(sample.tbl)){
-  R1 <- readFastq(str_c("fastq/", sample.tbl$R1_file[i]))
-  R2 <- readFastq(str_c("fastq/", sample.tbl$R2_file[i]))
-  vs_fastx_trim_filt(R1, R2, truncee_rate = 0.010) |> 
-    vs_fastq_mergepairs(output_format = "fasta") |> 
-    vs_fastx_uniques(output_format = "fasta", sample = sample.tbl$sample_id[i]) |> 
-    writeFasta(out.file = str_c("tmp/", sample.tbl$sample_id[i], ".fasta"))
+# Load libraries
+suppressWarnings(suppressMessages(library(tidyverse)))
+suppressWarnings(suppressMessages(library(microseq)))
+suppressWarnings(suppressMessages(library(Rsearch)))
+
+# Setup paths
+fastq.folder <- "mock_fastq"
+metadata.file <- "mock_metadata.txt"
+
+# Load metadata
+metadata.tbl <- read_tsv(metadata.file, show_col_types = FALSE)
+
+# Initiate empty table
+all.tbl <- tibble()
+
+# Threads
+threads <- 4
+
+# Run preprocessing for each sample
+for(i in 1:nrow(metadata.tbl)){
+  
+  R1.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R1_file[i]))
+  R2.tbl <- readFastq(file.path(fastq.folder, metadata.tbl$R2_file[i]))
+  
+  # Trim and filter
+  R1_filt.tbl <- vs_fastx_trim_filt(file.path(fastq.folder, metadata.tbl$R1_file[i]), 
+                                    file.path(fastq.folder, metadata.tbl$R2_file[i]),
+                                    minlen = 20, 
+                                    truncee_rate = 0.01, 
+                                    maxee_rate = 0.01
+  )
+  R2_filt.tbl <- attr(R1_filt.tbl, "reverse")
+  
+  # Merge reads
+  merged.tbl <- vs_fastq_mergepairs(R1_filt.tbl, R2_filt.tbl, threads = threads)
+  
+  # Dereplicate
+  derep.tbl <- vs_fastx_uniques(fastx_input = merged.tbl,
+                                sample = metadata.tbl$sample_id[i])
+  
+  # Add results to table
+  all.tbl <- bind_rows(all.tbl, derep.tbl)
 }
 
-all.tbl <- lapply(list.files("tmp", full.names = T), readFasta) |> 
-  bind_rows()
+# Dereplicate all reads together
+all_derep.tbl <- vs_fastx_uniques(all.tbl, minuniquesize = 2)
 
-unoise.tbl <- vs_cluster_unoise(all.tbl,
-                                relabel = "ZOTU")
+# Global chimera detection
+all_derep_wo_chimera.tbl <- vs_uchime_denovo(all_derep.tbl)
 
-sequence.tbl <- vs_uchime_denovo(unoise.tbl) |> 
-  separate_wider_delim(Header, delim = ";", names = c("Header", "size"))
-
-readcount.tbl <- unoise.tbl |> 
-  separate_wider_delim(Header, delim = ";", names = c("Header", "size")) |> 
-  filter(Header %in% sequence.tbl$Header)
+# Clustering
+sequence.tbl <- vs_cluster_unoise(all_derep_wo_chimera.tbl,
+                                  relabel = "OTU",
+                                  threads = threads)
