@@ -364,4 +364,5 @@ rsearch_res.tbl <- fasit.aln %>%
   )
 
 cat("Correlation with ground truth =", round(cor(rsearch_res.tbl$rsearch_rel_abundance, rsearch_res.tbl$groundtruth_rel_abundance), 4))
+cat("RMSE value =", round(sqrt(mean((rsearch_res.tbl$rsearch_rel_abundance - rsearch_res.tbl$groundtruth_rel_abundance)^2)), 4))
 ```
