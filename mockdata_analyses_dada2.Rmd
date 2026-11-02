@@ -286,5 +286,7 @@ dada2_res.tbl <- fasit.aln %>%
   )
 
 round(cor(dada2_res.tbl$dada2_rel_abundance, dada2_res.tbl$groundtruth_rel_abundance), 4)
+
+round(sqrt(mean((dada2_res.tbl$dada2_rel_abundance - dada2_res.tbl$groundtruth_rel_abundance)^2)), 4)
 ```
 
